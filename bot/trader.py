@@ -19,6 +19,7 @@ class Position:
     stop_loss: float
     peak_price: float
     moonbag_sold: bool = False
+    last_volume: float = 0
     opened_at: datetime = field(default_factory=datetime.utcnow)
     tx_hash: str = ""
 
@@ -32,7 +33,7 @@ class TradeResult:
     error: str = ""
 
 class Trader:
-    SLIPPAGE_BPS = 1000  # 10% slippage for fast moving meme coins
+    SLIPPAGE_BPS = 1000  # 10% slippage
 
     def __init__(self, config):
         self.config = config
@@ -46,10 +47,14 @@ class Trader:
         if len(self.positions) >= self.config.MAX_OPEN_POSITIONS:
             return TradeResult(success=False, error="Max open positions reached")
 
-        # Wait for price to stabilize before buying
+        # Wait for stable entry — avoid buying at peak
         stable = await self._wait_for_stable_entry(candidate)
         if not stable:
-            return TradeResult(success=False, error="Price not stable - skipping entry")
+            return TradeResult(success=False, error="Price unstable - skipping entry")
+
+        # Check buy pressure one more time before buying
+        if candidate.buy_pressure() < 55:
+            return TradeResult(success=False, error="Buy pressure too low before entry")
 
         size_usd = self.config.trade_size_for_chain(candidate.chain)
         logger.info("Buying %s for $%.2f on %s", candidate.symbol, size_usd, candidate.chain)
@@ -57,9 +62,9 @@ class Trader:
         if not self._has_key(candidate.chain):
             return TradeResult(success=False, error=f"No private key for {candidate.chain}")
 
-        # Moonbag strategy: TP at +100%, SL at -20%
-        tp = candidate.price_usd * 2.0    # +100% take profit
-        sl = candidate.price_usd * 0.80   # -20% stop loss
+        # Moonbag TPs: sell 50% at +100%, rest at +200%
+        tp = candidate.price_usd * 2.0   # +100%
+        sl = candidate.price_usd * 0.80  # -20%
 
         pos = Position(
             symbol=candidate.symbol,
@@ -72,6 +77,7 @@ class Trader:
             stop_loss=ai_result.stop_price or sl,
             peak_price=candidate.price_usd,
             moonbag_sold=False,
+            last_volume=candidate.volume_5m,
         )
         self.positions[candidate.address] = pos
         self.total_trades += 1
@@ -83,28 +89,40 @@ class Trader:
 
     async def _wait_for_stable_entry(self, candidate) -> bool:
         """
-        Wait up to 60 seconds for price to stabilize.
+        Wait for price to stabilize before entering.
         Avoids buying at the very peak of a pump.
-        A stable entry means price change slows down.
         """
-        logger.info("Waiting for stable entry on %s...", candidate.symbol)
+        logger.info("Checking entry stability for %s...", candidate.symbol)
         prev_price = candidate.price_usd
         await asyncio.sleep(15)
 
         current = await self._get_current_price(candidate.address)
         if current is None:
-            return True  # Can't check, proceed anyway
+            return True
 
-        change = abs(current - prev_price) / prev_price * 100
-        if change > 20:
-            logger.info("%s still pumping hard (%.1f%%) - waiting more", candidate.symbol, change)
-            await asyncio.sleep(15)
+        change = (current - prev_price) / prev_price * 100
+
+        # If still pumping hard — wait more
+        if change > 15:
+            logger.info("%s still pumping (%.1f%%) — waiting for dip", candidate.symbol, change)
+            await asyncio.sleep(20)
             current2 = await self._get_current_price(candidate.address)
-            if current2 and current2 < current * 0.85:
-                logger.info("%s dumping after pump - skipping", candidate.symbol)
+            if current2 is None:
+                return True
+            # If dumping after pump — skip
+            if current2 < current * 0.85:
+                logger.info("%s dumped after pump — skipping", candidate.symbol)
                 return False
+            # If consolidated — good entry
+            logger.info("%s consolidated — good entry!", candidate.symbol)
+            return True
 
-        logger.info("Entry stable for %s - proceeding", candidate.symbol)
+        # If dropping too fast — skip
+        if change < -15:
+            logger.info("%s dropping too fast (%.1f%%) — skipping", candidate.symbol, change)
+            return False
+
+        logger.info("%s price stable — entering!", candidate.symbol)
         return True
 
     def _has_key(self, chain):
@@ -120,11 +138,25 @@ class Trader:
             await asyncio.sleep(15)
             for address, pos in list(self.positions.items()):
                 try:
-                    price = await self._get_current_price(address)
+                    price, volume = await self._get_price_and_volume(address)
                     if price is None:
                         continue
 
                     pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+
+                    # FAST EXIT MODE — volume drops 50% suddenly
+                    if volume and pos.last_volume > 0:
+                        volume_drop = (pos.last_volume - volume) / pos.last_volume * 100
+                        if volume_drop > 50 and pnl_pct > 0:
+                            logger.info(
+                                "FAST EXIT: %s volume dropped %.0f%% — exiting at +%.1f%%",
+                                pos.symbol, volume_drop, pnl_pct
+                            )
+                            await self._telegram.send_fast_exit(pos, price, pnl_pct, volume_drop)
+                            await self._close_position(pos, price, "fast_exit")
+                            continue
+                    if volume:
+                        pos.last_volume = volume
 
                     # Update trailing stop
                     if self.config.TRAILING_STOP and price > pos.peak_price:
@@ -132,22 +164,22 @@ class Trader:
                         trail = price * (1 - self.config.TRAILING_STOP_PCT / 100)
                         pos.stop_loss = max(pos.stop_loss, trail)
 
-                    # MOONBAG STRATEGY: Sell 50% at +100%
+                    # MOONBAG: Sell 50% at +100%
                     if pnl_pct >= 100 and not pos.moonbag_sold:
                         logger.info("MOONBAG: Selling 50%% of %s at +%.1f%%", pos.symbol, pnl_pct)
                         await self._sell_partial(pos, price, 50)
                         pos.moonbag_sold = True
                         pos.stop_loss = pos.entry_price  # Move SL to breakeven
-                        logger.info("Stop loss moved to breakeven for %s", pos.symbol)
+                        await self._telegram.send_moonbag_triggered(pos, price, pnl_pct)
                         continue
 
-                    # Take profit at +200% on remaining moonbag
+                    # Sell remaining moonbag at +200%
                     if pos.moonbag_sold and pnl_pct >= 200:
-                        logger.info("MOONBAG TP: Selling remaining %s at +%.1f%%", pos.symbol, pnl_pct)
+                        logger.info("MOONBAG TP: Selling rest of %s at +%.1f%%", pos.symbol, pnl_pct)
                         await self._close_position(pos, price, "moonbag_tp")
                         continue
 
-                    # Normal take profit (if moonbag not triggered yet)
+                    # Normal take profit
                     if not pos.moonbag_sold and price >= pos.take_profit:
                         logger.info("TP hit for %s @ $%.8f", pos.symbol, price)
                         await self._close_position(pos, price, "take_profit")
@@ -161,31 +193,37 @@ class Trader:
                 except Exception as e:
                     logger.error("Monitor error for %s: %s", pos.symbol, e)
 
-    async def _sell_partial(self, pos, current_price, pct):
-        """Sell a percentage of a position."""
-        sold_usd = pos.size_usd * (pct / 100)
-        pnl = ((current_price - pos.entry_price) / pos.entry_price) * 100
-        logger.info(
-            "Partial sell: %s | Sold %.0f%% ($%.2f) | PnL: %+.1f%%",
-            pos.symbol, pct, sold_usd, pnl
-        )
-        self.total_pnl += sold_usd * (pnl / 100)
-        if pnl > 0:
-            self.winning_trades += 1
-
-    async def _get_current_price(self, address) -> Optional[float]:
+    async def _get_price_and_volume(self, address):
+        """Get current price and 5m volume."""
         url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
-                        data = await r.json()
+                        data  = await r.json()
                         pairs = data.get("pairs") or []
                         if pairs:
-                            return float(pairs[0].get("priceUsd", 0) or 0)
+                            price  = float(pairs[0].get("priceUsd", 0) or 0)
+                            volume = float(pairs[0].get("volume", {}).get("m5", 0) or 0)
+                            return price, volume
         except Exception:
             pass
-        return None
+        return None, None
+
+    async def _get_current_price(self, address) -> Optional[float]:
+        price, _ = await self._get_price_and_volume(address)
+        return price
+
+    async def _sell_partial(self, pos, current_price, pct):
+        sold_usd = pos.size_usd * (pct / 100)
+        pnl = ((current_price - pos.entry_price) / pos.entry_price) * 100
+        self.total_pnl += sold_usd * (pnl / 100)
+        if pnl > 0:
+            self.winning_trades += 1
+        logger.info(
+            "Partial sell: %s | %.0f%% ($%.2f) | PnL: %+.1f%%",
+            pos.symbol, pct, sold_usd, pnl
+        )
 
     async def _close_position(self, pos, current_price, reason):
         pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
@@ -197,7 +235,8 @@ class Trader:
             "Closing %s | Entry: $%.8f | Exit: $%.8f | PnL: %+.1f%% ($%+.2f) | Reason: %s",
             pos.symbol, pos.entry_price, current_price, pnl_pct, pnl_usd, reason
         )
-        del self.positions[pos.address]
+        if pos.address in self.positions:
+            del self.positions[pos.address]
         return pnl_pct
 
     def get_positions_summary(self) -> str:
