@@ -192,19 +192,19 @@ class Scanner:
         if c.price_change_5m < self.config.MIN_PRICE_CHANGE_PCT:
             return False
         # Avoid mid-pump entries
-        if c.price_change_5m > 40:
+        if c.price_change_5m > 50:
             logger.debug("Skipping %s - already pumped %.1f%%", c.symbol, c.price_change_5m)
             return False
         # Volume filter
         if c.volume_5m < self.config.MIN_VOLUME_USD_5M:
             return False
         # Upgraded liquidity filter
-        if c.liquidity_usd < 50000:
+        if c.liquidity_usd < 35000:
             return False
         if c.price_usd <= 0:
             return False
         # Buy pressure must be above 55%
-        if c.buy_pressure() < 55:
+        if c.buy_pressure() < 52:
             logger.debug("Skipping %s - low buy pressure %.1f%%", c.symbol, c.buy_pressure())
             return False
         return True

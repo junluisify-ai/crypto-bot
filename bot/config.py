@@ -19,7 +19,7 @@ class Config:
     BSC_RPC:     str = "https://bsc-dataseed.binance.org"
     TARGET_CHAINS: List[str] = field(default_factory=lambda: ["solana","ethereum","base","bsc"])
     SCAN_INTERVAL_SECONDS:  int   = 30
-    MIN_PRICE_CHANGE_PCT:   float = 15.0
+    MIN_PRICE_CHANGE_PCT:   float = 12.0
     MIN_VOLUME_USD_5M:      float = 50000
     MIN_LIQUIDITY_USD:      float = 30000
     MAX_TOKENS_PER_SCAN:    int   = 20
