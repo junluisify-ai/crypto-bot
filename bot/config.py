@@ -10,6 +10,7 @@ class Config:
     TELEGRAM_CHAT_ID:   str = os.getenv("TELEGRAM_CHAT_ID",   "")
     DEEPSEEK_API_KEY:   str = os.getenv("DEEPSEEK_API_KEY",   "")
     DEEPSEEK_BASE_URL:  str = "https://api.deepseek.com"
+    GEMINI_API_KEY:     str = os.getenv("GEMINI_API_KEY", "")
     SOLANA_PRIVATE_KEY: str = os.getenv("SOLANA_PRIVATE_KEY", "")
     ETH_PRIVATE_KEY:    str = os.getenv("ETH_PRIVATE_KEY",    "")
     BSC_PRIVATE_KEY:    str = os.getenv("BSC_PRIVATE_KEY",    "")
@@ -36,7 +37,7 @@ class Config:
     TRAILING_STOP:    bool  = True
     TRAILING_STOP_PCT: float = 10.0
     AI_MIN_CONFIDENCE: float = 70.0
-    AI_MODEL:          str   = "deepseek-chat"
+    AI_MODEL:          str   = "gemini-1.5-flash"
 
     def validate(self):
         import logging
