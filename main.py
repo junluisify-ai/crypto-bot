@@ -36,14 +36,17 @@ async def start_web():
 
 async def main():
     logger.info("CryptoBot starting up...")
-    config   = Config()
+    config = Config()
     config.validate()
+
     scanner  = Scanner(config)
     risk     = RiskChecker(config)
     ai       = AIAnalyst(config)
     trader   = Trader(config)
     telegram = TelegramBot(config, trader)
+
     scanner.set_pipeline(risk, ai, trader, telegram)
+
     await asyncio.gather(
         start_web(),
         telegram.start(),
