@@ -10,6 +10,7 @@ class Config:
     TELEGRAM_CHAT_ID:   str = os.getenv("TELEGRAM_CHAT_ID",   "")
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     SOLANA_PRIVATE_KEY: str = os.getenv("SOLANA_PRIVATE_KEY", "")
+    BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
     SOLANA_RPC: str = "https://api.mainnet-beta.solana.com"
     PAPER_TRADING: bool = os.getenv("PAPER_TRADING", "true").lower() == "true"
     PAPER_STARTING_BALANCE: float = 50.0

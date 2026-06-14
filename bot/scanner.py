@@ -56,11 +56,10 @@ class TokenCandidate:
         )
 
 class Scanner:
-    TRENDING_ENDPOINT  = "https://api.dexscreener.com/token-profiles/latest/v1"
-    TOKENS_ENDPOINT    = "https://api.dexscreener.com/latest/dex/tokens"
-    BOOSTED_ENDPOINT   = "https://api.dexscreener.com/token-boosts/top/v1"
-    SEARCH_ENDPOINT    = "https://api.dexscreener.com/latest/dex/search?q=solana"
-    PAIRS_ENDPOINT     = "https://api.dexscreener.com/latest/dex/pairs/solana"
+    TRENDING_ENDPOINT = "https://api.dexscreener.com/token-profiles/latest/v1"
+    TOKENS_ENDPOINT   = "https://api.dexscreener.com/latest/dex/tokens"
+    BIRDEYE_TRENDING  = "https://public-api.birdeye.so/defi/token_trending"
+    BIRDEYE_NEW       = "https://public-api.birdeye.so/defi/v2/tokens/new_listing"
 
     def __init__(self, config):
         self.config    = config
@@ -80,9 +79,16 @@ class Scanner:
         if hasattr(trader, 'set_telegram'):
             trader.set_telegram(telegram)
 
+    @property
+    def _birdeye_headers(self):
+        return {
+            "X-API-KEY": self.config.BIRDEYE_API_KEY,
+            "x-chain": "solana"
+        }
+
     async def run(self):
         self.running = True
-        logger.info("Scanner started — Solana only, 3 sources")
+        logger.info("Scanner started — Solana | DexScreener + Birdeye")
         async with aiohttp.ClientSession() as session:
             self._session = session
             while self.running:
@@ -96,13 +102,12 @@ class Scanner:
         self.running = False
 
     async def _scan_cycle(self):
-        logger.info("Scanning Solana — trending + boosted + new pairs...")
+        logger.info("Scanning Solana — DexScreener + Birdeye trending + Birdeye new...")
 
-        # Fetch from 3 sources in parallel
         results = await asyncio.gather(
-            self._get_trending(),
-            self._get_boosted(),
-            self._get_new_pairs(),
+            self._get_dexscreener_trending(),
+            self._get_birdeye_trending(),
+            self._get_birdeye_new(),
             return_exceptions=True
         )
 
@@ -111,16 +116,14 @@ class Scanner:
             if isinstance(r, list):
                 candidates.extend(r)
 
-        # Deduplicate by address
         seen_now = {}
         for c in candidates:
-            if c.address not in seen_now:
+            if c.address and c.address not in seen_now:
                 seen_now[c.address] = c
 
         fresh = [c for addr, c in seen_now.items() if addr not in self._seen]
-        logger.info("Found %d new Solana candidates across all sources", len(fresh))
+        logger.info("Found %d new Solana candidates", len(fresh))
 
-        # Sort: hype first, then by 5m change
         top = sorted(fresh, key=lambda x: (x.is_hype, x.price_change_5m), reverse=True)
 
         for candidate in top[:self.config.MAX_TOKENS_PER_SCAN]:
@@ -130,7 +133,7 @@ class Scanner:
         if len(self._seen) > 10000:
             self._seen = set(list(self._seen)[-5000:])
 
-    async def _get_trending(self):
+    async def _get_dexscreener_trending(self):
         try:
             async with self._session.get(
                 self.TRENDING_ENDPOINT,
@@ -140,53 +143,119 @@ class Scanner:
                     return []
                 data = await r.json()
                 addresses = [t.get("tokenAddress", "") for t in (data or [])[:30]]
-                return await self._fetch_token_details(addresses)
+                return await self._fetch_dex_token_details(addresses)
         except Exception as e:
-            logger.debug("Trending fetch error: %s", e)
+            logger.debug("DexScreener trending error: %s", e)
             return []
 
-    async def _get_boosted(self):
-        """Tokens with paid boosts — often more legitimate projects."""
+    async def _get_birdeye_trending(self):
+        """Birdeye trending tokens — much better quality than DexScreener."""
+        if not self.config.BIRDEYE_API_KEY:
+            return []
         try:
             async with self._session.get(
-                self.BOOSTED_ENDPOINT,
+                self.BIRDEYE_TRENDING,
+                headers=self._birdeye_headers,
+                params={"sort_by": "rank", "sort_type": "asc", "offset": 0, "limit": 20},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
                 if r.status != 200:
+                    logger.warning("Birdeye trending error: %s", r.status)
                     return []
                 data = await r.json()
-                addresses = [
-                    t.get("tokenAddress", "") for t in (data or [])[:20]
-                    if t.get("chainId", "").lower() == "solana"
-                ]
-                return await self._fetch_token_details(addresses)
-        except Exception as e:
-            logger.debug("Boosted fetch error: %s", e)
-            return []
-
-    async def _get_new_pairs(self):
-        """Newest Solana pairs with real volume."""
-        try:
-            async with self._session.get(
-                self.SEARCH_ENDPOINT,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                if r.status != 200:
-                    return []
-                data = await r.json()
+                items = data.get("data", {}).get("items", [])
+                logger.info("Birdeye trending returned %d tokens", len(items))
                 candidates = []
-                for pair in (data.get("pairs") or [])[:40]:
-                    if pair.get("chainId", "").lower() != "solana":
-                        continue
-                    c = self._pair_to_candidate(pair)
+                for item in items:
+                    c = self._birdeye_to_candidate(item)
                     if c and self._passes_filters(c):
                         candidates.append(c)
                 return candidates
         except Exception as e:
-            logger.debug("New pairs fetch error: %s", e)
+            logger.debug("Birdeye trending error: %s", e)
             return []
 
-    async def _fetch_token_details(self, addresses):
+    async def _get_birdeye_new(self):
+        """Birdeye new token listings — catch early movers."""
+        if not self.config.BIRDEYE_API_KEY:
+            return []
+        try:
+            async with self._session.get(
+                self.BIRDEYE_NEW,
+                headers=self._birdeye_headers,
+                params={"limit": 20, "meme_platform_enabled": True},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
+                    logger.warning("Birdeye new listing error: %s", r.status)
+                    return []
+                data = await r.json()
+                items = data.get("data", {}).get("items", [])
+                logger.info("Birdeye new listings returned %d tokens", len(items))
+                candidates = []
+                for item in items:
+                    c = self._birdeye_to_candidate(item)
+                    if c and self._passes_filters(c):
+                        candidates.append(c)
+                return candidates
+        except Exception as e:
+            logger.debug("Birdeye new listing error: %s", e)
+            return []
+
+    def _birdeye_to_candidate(self, item):
+        try:
+            address = item.get("address", "")
+            if not address:
+                return None
+
+            price_change_1h = float(item.get("priceChange1hPercent", 0) or 0)
+            liquidity_usd   = float(item.get("liquidity", 0) or 0)
+            volume_5m       = float(item.get("v5mUSD", 0) or 0)
+            volume_1h       = float(item.get("v1hUSD", 0) or 0)
+            price_change_5m = float(item.get("priceChange5mPercent", 0) or 0)
+
+            # Calculate age
+            listed_at = item.get("listingTime", 0) or 0
+            age_hours = 0
+            if listed_at:
+                age_hours = (datetime.utcnow().timestamp() - listed_at) / 3600
+
+            is_hype = (
+                price_change_1h >= self.config.HYPE_MIN_PRICE_CHANGE_1H
+                and liquidity_usd >= self.config.HYPE_MIN_LIQUIDITY
+            )
+
+            symbol = item.get("symbol", "???")
+            url    = f"https://dexscreener.com/solana/{address}"
+
+            return TokenCandidate(
+                chain="solana",
+                address=address,
+                symbol=symbol,
+                name=item.get("name", "Unknown"),
+                price_usd=float(item.get("price", 0) or 0),
+                price_change_5m=price_change_5m,
+                price_change_1h=price_change_1h,
+                price_change_24h=float(item.get("priceChange24hPercent", 0) or 0),
+                volume_5m=volume_5m,
+                volume_1h=volume_1h,
+                liquidity_usd=liquidity_usd,
+                market_cap=float(item.get("mc", 0) or 0),
+                pair_address=address,
+                dex_id="birdeye",
+                url=url,
+                buys_5m=int(item.get("buy5m", 0) or 0),
+                sells_5m=int(item.get("sell5m", 0) or 0),
+                buys_1h=int(item.get("buy1h", 0) or 0),
+                sells_1h=int(item.get("sell1h", 0) or 0),
+                age_hours=age_hours,
+                is_hype=is_hype,
+            )
+        except Exception as e:
+            logger.debug("Birdeye parse error: %s", e)
+            return None
+
+    async def _fetch_dex_token_details(self, addresses):
         if not addresses:
             return []
         results = []
@@ -206,14 +275,14 @@ class Scanner:
                     for pair in (data.get("pairs") or []):
                         if pair.get("chainId", "").lower() != "solana":
                             continue
-                        c = self._pair_to_candidate(pair)
+                        c = self._dex_pair_to_candidate(pair)
                         if c and self._passes_filters(c):
                             results.append(c)
             except Exception as e:
                 logger.debug("Token details error: %s", e)
         return results
 
-    def _pair_to_candidate(self, pair):
+    def _dex_pair_to_candidate(self, pair):
         try:
             chain = pair.get("chainId", "").lower()
             if chain != "solana":
@@ -274,7 +343,6 @@ class Scanner:
         if c.price_change_5m < self.config.MIN_PRICE_CHANGE_PCT:
             return False
         if c.price_change_5m > 60:
-            logger.debug("Skipping %s — already pumped %.1f%%", c.symbol, c.price_change_5m)
             return False
         if c.volume_5m < self.config.MIN_VOLUME_USD_5M:
             return False
@@ -283,7 +351,6 @@ class Scanner:
         if c.price_usd <= 0:
             return False
         if c.buy_pressure() < 50:
-            logger.debug("Skipping %s — low buy pressure %.1f%%", c.symbol, c.buy_pressure())
             return False
         return True
 
