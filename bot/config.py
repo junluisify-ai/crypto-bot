@@ -15,11 +15,11 @@ class Config:
     PAPER_STARTING_BALANCE: float = 50.0
     TARGET_CHAINS: List[str] = field(default_factory=lambda: ["solana"])
     SCAN_INTERVAL_SECONDS: int   = 30
-    MIN_PRICE_CHANGE_PCT:  float = 10.0
-    MIN_VOLUME_USD_5M:     float = 20000
-    MIN_LIQUIDITY_USD:     float = 35000
+    MIN_PRICE_CHANGE_PCT:  float = 5.0
+    MIN_VOLUME_USD_5M:     float = 10000
+    MIN_LIQUIDITY_USD:     float = 25000
     MAX_TOKENS_PER_SCAN:   int   = 20
-    MAX_RUGCHECK_RISK_SCORE: int   = 400
+    MAX_RUGCHECK_RISK_SCORE: int   = 600
     MIN_LP_LOCKED_PCT:       float = 0.0
     BLACKLISTED_TOKENS: List[str] = field(default_factory=list)
     TRADE_SIZE_USD_SOLANA: float = float(os.getenv("TRADE_SIZE_SOL", "3"))
@@ -29,17 +29,17 @@ class Config:
     STOP_LOSS_PCT:      float = 20.0
     TRAILING_STOP:      bool  = True
     TRAILING_STOP_PCT:  float = 10.0
-    TIER_A_MIN_LIQUIDITY:   float = 80000
+    TIER_A_MIN_LIQUIDITY:   float = 60000
     TIER_A_MAX_FLAGS:       int   = 0
-    TIER_A_MIN_LP_LOCKED:   float = 50.0
-    TIER_B_MIN_LIQUIDITY:   float = 50000
+    TIER_A_MIN_LP_LOCKED:   float = 30.0
+    TIER_B_MIN_LIQUIDITY:   float = 25000
     TIER_B_MAX_FLAGS:       int   = 1
     TIER_B_MIN_LP_LOCKED:   float = 0.0
-    AI_MIN_CONFIDENCE: float = 65.0
+    AI_MIN_CONFIDENCE: float = 60.0
     AI_MODEL:          str   = "gemini-1.5-flash"
-    HYPE_MIN_PRICE_CHANGE_1H: float = 50.0
-    HYPE_MIN_LIQUIDITY:       float = 50000
-    HYPE_MAX_RISK_SCORE:      int   = 300
+    HYPE_MIN_PRICE_CHANGE_1H: float = 30.0
+    HYPE_MIN_LIQUIDITY:       float = 25000
+    HYPE_MAX_RISK_SCORE:      int   = 600
 
     def validate(self):
         import logging
