@@ -56,8 +56,11 @@ class TokenCandidate:
         )
 
 class Scanner:
-    TRENDING_ENDPOINT = "https://api.dexscreener.com/token-profiles/latest/v1"
-    TOKENS_ENDPOINT   = "https://api.dexscreener.com/latest/dex/tokens"
+    TRENDING_ENDPOINT  = "https://api.dexscreener.com/token-profiles/latest/v1"
+    TOKENS_ENDPOINT    = "https://api.dexscreener.com/latest/dex/tokens"
+    BOOSTED_ENDPOINT   = "https://api.dexscreener.com/token-boosts/top/v1"
+    SEARCH_ENDPOINT    = "https://api.dexscreener.com/latest/dex/search?q=solana"
+    PAIRS_ENDPOINT     = "https://api.dexscreener.com/latest/dex/pairs/solana"
 
     def __init__(self, config):
         self.config    = config
@@ -79,7 +82,7 @@ class Scanner:
 
     async def run(self):
         self.running = True
-        logger.info("Scanner started — Solana only")
+        logger.info("Scanner started — Solana only, 3 sources")
         async with aiohttp.ClientSession() as session:
             self._session = session
             while self.running:
@@ -93,12 +96,31 @@ class Scanner:
         self.running = False
 
     async def _scan_cycle(self):
-        logger.info("Scanning Solana for opportunities...")
-        candidates = await self._get_trending()
-        fresh = [c for c in candidates if c.address not in self._seen]
-        logger.info("Found %d new Solana candidates", len(fresh))
+        logger.info("Scanning Solana — trending + boosted + new pairs...")
 
-        # Sort: hype tokens first, then by 5m price change
+        # Fetch from 3 sources in parallel
+        results = await asyncio.gather(
+            self._get_trending(),
+            self._get_boosted(),
+            self._get_new_pairs(),
+            return_exceptions=True
+        )
+
+        candidates = []
+        for r in results:
+            if isinstance(r, list):
+                candidates.extend(r)
+
+        # Deduplicate by address
+        seen_now = {}
+        for c in candidates:
+            if c.address not in seen_now:
+                seen_now[c.address] = c
+
+        fresh = [c for addr, c in seen_now.items() if addr not in self._seen]
+        logger.info("Found %d new Solana candidates across all sources", len(fresh))
+
+        # Sort: hype first, then by 5m change
         top = sorted(fresh, key=lambda x: (x.is_hype, x.price_change_5m), reverse=True)
 
         for candidate in top[:self.config.MAX_TOKENS_PER_SCAN]:
@@ -123,12 +145,55 @@ class Scanner:
             logger.debug("Trending fetch error: %s", e)
             return []
 
+    async def _get_boosted(self):
+        """Tokens with paid boosts — often more legitimate projects."""
+        try:
+            async with self._session.get(
+                self.BOOSTED_ENDPOINT,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                addresses = [
+                    t.get("tokenAddress", "") for t in (data or [])[:20]
+                    if t.get("chainId", "").lower() == "solana"
+                ]
+                return await self._fetch_token_details(addresses)
+        except Exception as e:
+            logger.debug("Boosted fetch error: %s", e)
+            return []
+
+    async def _get_new_pairs(self):
+        """Newest Solana pairs with real volume."""
+        try:
+            async with self._session.get(
+                self.SEARCH_ENDPOINT,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                candidates = []
+                for pair in (data.get("pairs") or [])[:40]:
+                    if pair.get("chainId", "").lower() != "solana":
+                        continue
+                    c = self._pair_to_candidate(pair)
+                    if c and self._passes_filters(c):
+                        candidates.append(c)
+                return candidates
+        except Exception as e:
+            logger.debug("New pairs fetch error: %s", e)
+            return []
+
     async def _fetch_token_details(self, addresses):
         if not addresses:
             return []
         results = []
         for i in range(0, len(addresses), 30):
-            batch = addresses[i:i+30]
+            batch = [a for a in addresses[i:i+30] if a]
+            if not batch:
+                continue
             url = f"{self.TOKENS_ENDPOINT}/{','.join(batch)}"
             try:
                 async with self._session.get(
@@ -139,6 +204,8 @@ class Scanner:
                         continue
                     data = await r.json()
                     for pair in (data.get("pairs") or []):
+                        if pair.get("chainId", "").lower() != "solana":
+                            continue
                         c = self._pair_to_candidate(pair)
                         if c and self._passes_filters(c):
                             results.append(c)
@@ -149,7 +216,6 @@ class Scanner:
     def _pair_to_candidate(self, pair):
         try:
             chain = pair.get("chainId", "").lower()
-            # Solana only
             if chain != "solana":
                 return None
             pc   = pair.get("priceChange", {})
@@ -169,7 +235,6 @@ class Scanner:
             price_change_1h = float(pc.get("h1", 0) or 0)
             liquidity_usd   = float(liq.get("usd", 0) or 0)
 
-            # Flag hype tokens — big 1h move + decent liquidity
             is_hype = (
                 price_change_1h >= self.config.HYPE_MIN_PRICE_CHANGE_1H
                 and liquidity_usd >= self.config.HYPE_MIN_LIQUIDITY
@@ -202,11 +267,13 @@ class Scanner:
             return None
 
     def _passes_filters(self, c) -> bool:
+        if not c or not c.address:
+            return False
         if c.address in self.config.BLACKLISTED_TOKENS:
             return False
         if c.price_change_5m < self.config.MIN_PRICE_CHANGE_PCT:
             return False
-        if c.price_change_5m > 50:
+        if c.price_change_5m > 60:
             logger.debug("Skipping %s — already pumped %.1f%%", c.symbol, c.price_change_5m)
             return False
         if c.volume_5m < self.config.MIN_VOLUME_USD_5M:
@@ -215,7 +282,7 @@ class Scanner:
             return False
         if c.price_usd <= 0:
             return False
-        if c.buy_pressure() < 52:
+        if c.buy_pressure() < 50:
             logger.debug("Skipping %s — low buy pressure %.1f%%", c.symbol, c.buy_pressure())
             return False
         return True
@@ -227,10 +294,8 @@ class Scanner:
             candidate.buy_pressure(), candidate.age_hours, candidate.is_hype
         )
 
-        # Risk check
         risk_result = await self._risk.check(candidate)
 
-        # Hype token alert — send regardless of trade decision
         if candidate.is_hype:
             await self._telegram.send_hype_alert(candidate, risk_result)
 
@@ -239,7 +304,6 @@ class Scanner:
             await self._telegram.send_skipped(candidate, risk_result.reason)
             return
 
-        # AI analysis
         ai_result = await self._ai.analyse(candidate, risk_result)
         if ai_result.confidence < self.config.AI_MIN_CONFIDENCE:
             logger.info("AI skipped %s (%.1f%% confidence)", candidate.symbol, ai_result.confidence)
